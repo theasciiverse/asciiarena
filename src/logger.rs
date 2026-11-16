@@ -1,85 +1,91 @@
-use fern::colors::{Color, ColoredLevelConfig};
+use clap::{Arg, ArgMatches};
 use log::{LevelFilter};
-use colored::{Colorize};
-use clap::{crate_name};
 
-use std::str::{FromStr};
-
-#[derive(PartialEq)]
-pub enum Level {
-    Off,
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-    Dev,
-}
-
-#[derive(Debug, Clone)]
-pub struct LevelUnknown;
+use std::io::{Write};
 
 pub const LOG_LEVELS: [&str; 7] = ["off", "error", "warning", "info", "debug", "trace", "dev"];
 
-impl FromStr for Level {
-    type Err = LevelUnknown;
+#[derive(PartialEq, Clone, Copy)]
+pub enum Mode {
+    /// Logs to stdout at info unless told otherwise.
+    Server,
+    /// Silent unless told otherwise: the screen belongs to the game.
+    Client,
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "off" => Ok(Level::Off),
-            "error" => Ok(Level::Error),
-            "warning" => Ok(Level::Warn),
-            "info" => Ok(Level::Info),
-            "debug" => Ok(Level::Debug),
-            "trace" => Ok(Level::Trace),
-            "dev" => Ok(Level::Dev),
-            _ => Err(LevelUnknown),
-        }
+pub fn global_args() -> Vec<Arg> {
+    vec![
+        Arg::new("log")
+            .long("log")
+            .short('l')
+            .value_name("LEVEL")
+            .value_parser(LOG_LEVELS)
+            .global(true)
+            .help("Set the log level of verbosity (RUST_LOG works too)"),
+        Arg::new("log-file")
+            .long("log-file")
+            .value_name("FILE")
+            .global(true)
+            .help("Write the log to this file"),
+    ]
+}
+
+fn filter_for(level: &str) -> String {
+    let crate_name = env!("CARGO_PKG_NAME");
+    match level {
+        "warning" => format!("{}=warn", crate_name),
+        "dev" => "trace".into(),
+        level => format!("{}={}", crate_name, level),
     }
 }
 
-pub enum Output<'a> {
-    Stdout,
-    File(&'a str),
-}
+/// `--log` wins over `RUST_LOG`. A client logs to `--log-file`, to stderr when
+/// only `RUST_LOG` is set (`RUST_LOG=debug asciiarena 2>log`), or to
+/// asciiarena.log in the state folder when only `--log` is given.
+pub fn init(matches: &ArgMatches, mode: Mode) {
+    let level = matches.get_one::<String>("log").cloned();
+    let env_filter = std::env::var("RUST_LOG").ok().filter(|filter| !filter.is_empty());
 
-pub fn init(level: Level, output: Output) {
-    let level_colors = ColoredLevelConfig::new()
-        .error(Color::Red)
-        .warn(Color::Yellow)
-        .info(Color::Cyan)
-        .debug(Color::White)
-        .trace(Color::BrightBlack);
+    let filter = match (&level, &env_filter, mode) {
+        (Some(level), _, _) => filter_for(level),
+        (None, Some(filter), _) => filter.clone(),
+        (None, None, Mode::Server) => filter_for("info"),
+        (None, None, Mode::Client) => return,
+    };
+    if filter == filter_for("off") {
+        return
+    }
 
-    let log_config = fern::Dispatch::new().level(LevelFilter::Off);
+    let mut builder = env_logger::Builder::new();
+    builder.parse_filters(&filter).format_timestamp_millis();
 
-    let log_config = match level {
-        Level::Off => return,
-        Level::Error => log_config.level_for(crate_name!(), LevelFilter::Error),
-        Level::Warn => log_config.level_for(crate_name!(), LevelFilter::Warn),
-        Level::Info => log_config.level_for(crate_name!(), LevelFilter::Info),
-        Level::Debug => log_config.level_for(crate_name!(), LevelFilter::Debug),
-        Level::Trace => log_config.level_for(crate_name!(), LevelFilter::Trace),
-        Level::Dev => log_config.level(LevelFilter::Trace),
+    let file = match matches.get_one::<String>("log-file") {
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None if mode == Mode::Client && level.is_some() => {
+            crate::settings::state_dir().map(|dir| dir.join("asciiarena.log"))
+        }
+        None => None,
     };
 
-    let log_config = log_config.format(move |out, message, record| {
-        let target =
-            if level == Level::Dev { format!("[{}] ", record.target()) } else { String::new() };
+    match file {
+        Some(path) => match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+                builder.write_style(env_logger::WriteStyle::Never);
+            }
+            Err(error) => {
+                let _ = writeln!(std::io::stderr(), "Can not open log file {}: {}", path.display(), error);
+                return
+            }
+        },
+        None => {
+            builder.target(match mode {
+                Mode::Server => env_logger::Target::Stdout,
+                Mode::Client => env_logger::Target::Stderr,
+            });
+        }
+    }
 
-        out.finish(format_args!(
-            "{}{}{} {}",
-            format!("[{}] ", chrono::Local::now().format("%H:%M:%S")).white(),
-            target.white(),
-            level_colors.color(record.level()),
-            format!("{}", message).bright_white(),
-        ))
-    });
-
-    let log_config = match output {
-        Output::Stdout => log_config.chain(std::io::stdout()),
-        Output::File(name) => log_config.chain(fern::log_file(name).unwrap()),
-    };
-
-    log_config.apply().unwrap();
+    let _ = builder.try_init();
+    log::set_max_level(log::max_level().max(LevelFilter::Off));
 }

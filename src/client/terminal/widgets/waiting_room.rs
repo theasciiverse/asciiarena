@@ -2,13 +2,13 @@ use crate::client::state::{State};
 
 use crate::direction::{Direction};
 
-use tui::widgets::{Widget};
-use tui::buffer::{Buffer};
-use tui::layout::{Rect};
-use tui::style::{Style, Modifier};
+use ratatui::widgets::{Widget};
+use ratatui::buffer::{Buffer};
+use ratatui::layout::{Rect};
+use ratatui::style::{Style, Modifier};
 
 use rand::{
-    distributions::{Distribution, Uniform},
+    distr::{Distribution, Uniform},
     Rng,
 };
 
@@ -33,20 +33,20 @@ impl WaitingRoom {
 
     pub fn update(&mut self, state: &State) {
         const MINIMAL_MOVE_TIME: Duration = Duration::from_millis(500);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         self.players.retain(|player, _| state.server.logged_players.contains(player));
         for player in &state.server.logged_players {
             if !self.players.contains_key(player) {
-                let x_range = Uniform::from(0..self.dimension.0);
-                let y_range = Uniform::from(0..self.dimension.1);
+                let x_range = Uniform::new(0, self.dimension.0.max(1)).unwrap();
+                let y_range = Uniform::new(0, self.dimension.1.max(1)).unwrap();
                 let position = (x_range.sample(&mut rng), y_range.sample(&mut rng));
 
                 self.players.insert(
                     *player,
                     PlayerState {
                         position,
-                        direction: rng.gen(),
+                        direction: rng.random(),
                         last_move: Instant::now() - MINIMAL_MOVE_TIME,
                     },
                 );
@@ -60,11 +60,11 @@ impl WaitingRoom {
         for state in self.players.values_mut() {
             if now > state.last_move + MINIMAL_MOVE_TIME {
                 state.last_move = now;
-                let should_move = rng.gen::<f32>() < 0.85;
+                let should_move = rng.random::<f32>() < 0.85;
                 if should_move {
-                    let should_turn = rng.gen::<f32>() < 0.33;
+                    let should_turn = rng.random::<f32>() < 0.33;
                     if should_turn {
-                        match rng.gen::<bool>() {
+                        match rng.random::<bool>() {
                             true => state.direction.turn_right(),
                             false => state.direction.turn_left(),
                         }
@@ -109,8 +109,7 @@ impl Widget for WaitingRoomWidget<'_> {
         for (player, state) in &self.waiting_room.players {
             let draw_at = (state.position.0 * 2, state.position.1);
             if draw_at.0 < area.width && draw_at.1 < area.height {
-                buffer
-                    .get_mut(area.x + draw_at.0, area.y + draw_at.1)
+                buffer[(area.x + draw_at.0, area.y + draw_at.1)]
                     .set_char(*player)
                     .set_style(Style::default().add_modifier(Modifier::BOLD));
             }

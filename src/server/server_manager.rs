@@ -1,11 +1,12 @@
 use super::session::{RoomSession, SessionStatus};
-use super::game::{Game};
+use super::game::{Game, GameConfig, Contender};
 use super::game::arena::{Arena};
 
 use crate::message::{
     ClientMessage, ServerMessage, ServerInfo, GameInfo, ArenaInfo, LoginStatus, LoggedKind,
-    EntityData, Frame, GameEvent, SpellData,
+    EntityData, Frame, GameEvent, SpellData, PlayerInfo, BotLevel, Cause,
 };
+use crate::specification::{skills, spells};
 use crate::encoding::{self, Encoder};
 use crate::version::{self, Compatibility};
 use crate::direction::{Direction};
@@ -17,12 +18,18 @@ use message_io::network::{Endpoint, Transport, NetEvent};
 
 use itertools::{Itertools};
 
+use rand::{Rng, SeedableRng};
+use rand::rngs::{StdRng};
+use rand::seq::{SliceRandom};
+
 use std::time::{Duration, Instant};
 use std::collections::{HashSet};
+use std::net::{IpAddr, SocketAddr};
 
-lazy_static! {
-    static ref GAME_STEP_DURATION: Duration = Duration::from_secs_f32(1.0 / 30.0);
-}
+const GAME_STEP_DURATION: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+/// Steps between two snapshots in the debug log, about half a second.
+const SNAPSHOT_STEPS: usize = 15;
 
 #[derive(Debug)]
 enum Signal {
@@ -33,12 +40,35 @@ enum Signal {
 }
 
 pub struct Config {
+    /// Where to listen: 0.0.0.0 for the local network, 127.0.0.1 for a game on this computer.
+    pub interface: IpAddr,
+    /// 0 takes any free port.
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// People the game waits for.
     pub players_number: u8,
-    pub map_size: usize,
-    pub winner_points: usize,
+    /// Computer players added when the game starts.
+    pub bots: usize,
+    pub bot_level: BotLevel,
+    /// The computer plays for the people too (`--demo`).
+    pub autopilot: Option<BotLevel>,
+    pub game: GameConfig,
+    /// Pause before each arena, to see who won the last one.
     pub arena_waiting: Duration,
+    /// Pause before the first arena.
+    pub first_arena_waiting: Duration,
+}
+
+/// Stops a running server from another thread.
+#[derive(Clone)]
+pub struct ServerHandle {
+    node: NodeHandler<Signal>,
+}
+
+impl ServerHandle {
+    pub fn stop(&self) {
+        self.node.signals().send_with_priority(Signal::Close);
+    }
 }
 
 pub struct ServerManager {
@@ -50,46 +80,39 @@ pub struct ServerManager {
     room: RoomSession<char>,
     game: Option<Game>,
     waiting_arena_from: Option<Instant>,
+    waiting_arena_for: Duration,
+    rng: StdRng,
+    steps: usize,
 }
 
 impl ServerManager {
-    pub fn new(config: Config) -> Option<ServerManager> {
+    pub fn new(mut config: Config) -> Option<ServerManager> {
         let (node, listener) = node::split();
-        /*
-        Network::split_and_map_from_adapter(|adapter_event| match adapter_event {
-            AdapterEvent::Added(endpoint) => Event::Connected(endpoint),
-            AdapterEvent::Data(endpoint, data) => match encoding::decode(&data) {
-                Some(message) => Event::Message(endpoint, message),
-                None => Event::DeserializationError(endpoint),
-            },
-            AdapterEvent::Removed(endpoint) => Event::Disconnected(endpoint),
-        });
-        */
 
-        let node_closer = node.clone();
-        ctrlc::set_handler(move || node_closer.signals().send_with_priority(Signal::Close))
-            .unwrap();
-
-        let network_interface = "0.0.0.0";
-        if node
-            .network()
-            .listen(Transport::FramedTcp, (network_interface, config.tcp_port))
-            .is_err()
-        {
-            log::error!("Can not run server on TCP port {}", config.tcp_port);
-            return None
+        let interface = config.interface;
+        match node.network().listen(Transport::FramedTcp, (interface, config.tcp_port)) {
+            Ok((_, addr)) => config.tcp_port = addr.port(),
+            Err(_) => {
+                log::error!("Can not run server on TCP port {}", config.tcp_port);
+                return None
+            }
         }
 
-        if node.network().listen(Transport::Udp, (network_interface, config.udp_port)).is_err() {
-            log::error!("Can not run server on UDP port {}", config.udp_port);
-            return None
+        match node.network().listen(Transport::Udp, (interface, config.udp_port)) {
+            Ok((_, addr)) => config.udp_port = addr.port(),
+            Err(_) => {
+                log::error!("Can not run server on UDP port {}", config.udp_port);
+                return None
+            }
         }
 
         log::info!(
-            "Server running on ports {} (tcp) and {} (udp) for {} players",
+            "Server running on {} ports {} (tcp) and {} (udp) for {} players and {} bots",
+            interface,
             config.tcp_port,
             config.udp_port,
-            config.players_number
+            config.players_number,
+            config.bots,
         );
 
         Some(ServerManager {
@@ -100,8 +123,20 @@ impl ServerManager {
             room: RoomSession::new(config.players_number as usize),
             game: None,
             waiting_arena_from: None,
+            waiting_arena_for: Duration::ZERO,
+            rng: StdRng::seed_from_u64(config.game.seed),
+            steps: 0,
             config,
         })
+    }
+
+    pub fn handle(&self) -> ServerHandle {
+        ServerHandle { node: self.node.clone() }
+    }
+
+    /// The address clients connect to.
+    pub fn tcp_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.config.interface, self.config.tcp_port)
     }
 
     fn send_to_client(&mut self, endpoint: Endpoint, message: ServerMessage) {
@@ -129,6 +164,7 @@ impl ServerManager {
             },
             NodeEvent::Network(network) => match network {
                 NetEvent::Connected(endpoint, _) => log::trace!("{} has connected", endpoint),
+                NetEvent::Accepted(endpoint, _) => log::debug!("{} has connected", endpoint),
                 NetEvent::Disconnected(endpoint) => {
                     log::trace!("{} has disconnected", endpoint);
                     self.process_disconnection(endpoint);
@@ -203,9 +239,13 @@ impl ServerManager {
         let info = ServerInfo {
             udp_port: self.config.udp_port,
             players_number: self.config.players_number,
-            map_size: self.config.map_size as u16,
-            winner_points: self.config.winner_points as u16,
+            map_size: self.config.game.map_size as u16,
+            winner_points: self.config.game.winner_points as u16,
             logged_players: self.room.sessions().map(|session| *session.user()).collect(),
+            rounds: self.config.game.rounds as u16,
+            bots: self.config.bots as u8,
+            bot_level: self.config.bot_level,
+            arena: self.config.game.arena.name().into(),
         };
 
         log::trace!("Client {} has subscribed to server info", endpoint.addr());
@@ -285,8 +325,7 @@ impl ServerManager {
                         if let Some(waiting_from) = self.waiting_arena_from {
                             let duration = Instant::now().duration_since(waiting_from);
                             let waiting = self
-                                .config
-                                .arena_waiting
+                                .waiting_arena_for
                                 .checked_sub(duration)
                                 .unwrap_or_else(|| Duration::new(0, 0));
                             let message = ServerMessage::WaitArena(waiting);
@@ -356,39 +395,58 @@ impl ServerManager {
     }
 
     fn process_create_game(&mut self) {
-        log::info!("Starting new game");
-        let player_symbols = self.room.sessions().map(|session| *session.user());
-        let game = Game::new(self.config.map_size, self.config.winner_points, player_symbols);
+        let humans = self.room.sessions().map(|session| *session.user()).collect::<Vec<_>>();
+        let mut free = ('A'..='Z').filter(|symbol| !humans.contains(symbol)).collect::<Vec<_>>();
+        free.shuffle(&mut self.rng);
+
+        let mut contenders = humans
+            .iter()
+            .map(|&symbol| Contender { symbol, bot: self.config.autopilot, human: true })
+            .collect::<Vec<_>>();
+        contenders.extend(free.into_iter().take(self.config.bots).map(|symbol| Contender {
+            symbol,
+            bot: Some(self.config.bot_level),
+            human: false,
+        }));
+
+        log::info!(
+            "Starting new game: {}",
+            util::format::items_to_string(contenders.iter().map(|c| match c.bot {
+                Some(level) if !c.human => format!("{} (bot, {})", c.symbol, level.name()),
+                _ => c.symbol.to_string(),
+            }))
+        );
+
+        let game_config = GameConfig { seed: self.rng.random(), ..self.config.game.clone() };
+        let game = Game::new(game_config, contenders);
 
         let message = Self::create_start_game_message(&game);
         self.send_to_all_clients(self.room.safe_endpoints(), message);
 
         self.game = Some(game);
-        self.process_wait_arena();
+        self.process_wait_arena(self.config.first_arena_waiting);
 
         self.node.signals().send(Signal::GameStep);
     }
 
-    fn process_wait_arena(&mut self) {
-        log::trace!(
-            "Initializing next arena in {} seconds...",
-            self.config.arena_waiting.as_secs_f32()
-        );
+    fn process_wait_arena(&mut self, waiting: Duration) {
+        log::trace!("Initializing next arena in {} seconds...", waiting.as_secs_f32());
 
-        let message = ServerMessage::WaitArena(self.config.arena_waiting);
+        let message = ServerMessage::WaitArena(waiting);
         self.send_to_all_clients(self.room.safe_endpoints(), message);
 
-        self.node.signals().send_with_timer(Signal::AsyncStartArena, self.config.arena_waiting);
+        self.node.signals().send_with_timer(Signal::AsyncStartArena, waiting);
 
         self.waiting_arena_from = Some(Instant::now());
+        self.waiting_arena_for = waiting;
     }
 
     fn process_start_arena(&mut self) {
         self.waiting_arena_from = None;
-        self.game.as_mut().unwrap().create_new_arena();
+        self.game.as_mut().unwrap().create_new_arena(Instant::now());
         let game = self.game.as_ref().unwrap();
         let arena = game.arena().unwrap();
-        log::info!("Start arena {}", game.arena_number());
+        log::info!("Start arena {}: {}", game.arena_number(), arena.map().name());
 
         let entities = arena.entities();
         let player_positions = game
@@ -415,46 +473,86 @@ impl ServerManager {
         log::trace!("Processing step");
 
         let game = self.game.as_mut().unwrap();
-        let previous_players = game.living_players().len();
-
-        game.step();
+        let events = game.step(Instant::now());
 
         if let Some(arena) = game.arena() {
             let message = Self::create_game_step_message(arena);
             self.send_to_all_clients(self.room.faster_endpoints(), message);
         }
 
-        let game = self.game.as_ref().unwrap();
-        let current_players = game.living_players().len();
+        self.steps += 1;
+        if self.steps % SNAPSHOT_STEPS == 0 {
+            self.log_snapshot();
+        }
 
-        if current_players < previous_players {
-            let player_total_points_pairs = game
-                .pole()
-                .iter()
-                .map(|player| (player.character().symbol(), player.points()))
-                .collect::<Vec<_>>();
-
-            log::info!("Points: {}", util::format::pair_items_to_string(player_total_points_pairs));
-
-            let points = game.players().values().map(|player| player.points()).collect();
-
-            let message = ServerMessage::GameEvent(GameEvent::PlayerPointsUpdated(points));
+        for event in events {
+            match &event {
+                GameEvent::PlayerKilled(victim, killer, cause) => {
+                    let by = match cause {
+                        Cause::Spell(spell) => spells::spec(*spell).name,
+                        Cause::Storm => "the storm",
+                    };
+                    match killer {
+                        Some(killer) => log::info!("{} is out: {} of {}", victim, by, killer),
+                        None => log::info!("{} is out: {}", victim, by),
+                    }
+                }
+                GameEvent::ArenaWinner(winner) => log::info!("Arena winner: {:?}", winner),
+                GameEvent::PlayerPointsUpdated(_) => {
+                    let game = self.game.as_ref().unwrap();
+                    let player_total_points_pairs = game
+                        .pole()
+                        .iter()
+                        .map(|player| (player.character().symbol(), player.points()))
+                        .collect::<Vec<_>>();
+                    log::info!("Points: {}", util::format::pair_items_to_string(player_total_points_pairs));
+                }
+            }
+            let message = ServerMessage::GameEvent(event);
             self.send_to_all_clients(self.room.safe_endpoints(), message);
         }
 
         let game = self.game.as_ref().unwrap();
         if game.has_finished() {
             log::info!("End game");
-            let message = ServerMessage::FinishGame;
+            let message = ServerMessage::FinishGame(game.standings());
             self.send_to_all_clients(self.room.safe_endpoints(), message);
             self.process_reset();
         }
         else {
-            if current_players <= 1 && self.waiting_arena_from.is_none() {
+            if game.is_arena_over() && self.waiting_arena_from.is_none() {
                 log::info!("End arena");
-                self.process_wait_arena();
+                self.process_wait_arena(self.config.arena_waiting);
             }
-            self.node.signals().send_with_timer(Signal::GameStep, *GAME_STEP_DURATION);
+            self.node.signals().send_with_timer(Signal::GameStep, GAME_STEP_DURATION);
+        }
+    }
+
+    fn log_snapshot(&self) {
+        let game = match &self.game {
+            Some(game) => game,
+            None => return,
+        };
+        if let Some(arena) = game.arena() {
+            let mut entities = arena.entities().values().collect::<Vec<_>>();
+            entities.sort_by_key(|entity| entity.character().symbol());
+            log::debug!(
+                "snapshot: arena {} {} storm {} spells {} | {}",
+                game.arena_number(),
+                arena.map().name(),
+                arena.storm(),
+                arena.spells().len(),
+                entities
+                    .iter()
+                    .map(|entity| format!(
+                        "{} {} hp {} en {}",
+                        entity.character().symbol(),
+                        entity.position(),
+                        entity.health(),
+                        entity.energy()
+                    ))
+                    .join(", ")
+            );
         }
     }
 
@@ -517,24 +615,38 @@ impl ServerManager {
             players: game
                 .players()
                 .iter()
-                .map(|(_, player)| (player.character().id(), player.points()))
+                .map(|(_, player)| PlayerInfo {
+                    character_id: player.character().id(),
+                    points: player.points(),
+                    kills: player.kills(),
+                    rounds_won: player.rounds_won(),
+                    bot: if player.is_human() { None } else { player.bot() },
+                })
                 .collect(),
+            rounds: game.config().rounds,
+            winner_points: game.config().winner_points,
         };
 
         ServerMessage::StartGame(game_info)
     }
 
     fn create_start_arena_message(game: &Game) -> ServerMessage {
+        let arena = game.arena().unwrap();
         let arena_info = ArenaInfo {
             number: game.arena_number(),
             players: game.players().iter().map(|(_, player)| player.entity_id()).collect(),
-            ground: game.arena().unwrap().map().ground().clone(),
+            ground: arena.map().ground().clone(),
+            name: arena.map().name().into(),
+            width: arena.map().width() as u16,
+            height: arena.map().height() as u16,
+            storm_after: arena.storm_after(),
         };
 
         ServerMessage::StartArena(arena_info)
     }
 
     fn create_game_step_message(arena: &Arena) -> ServerMessage {
+        let now = Instant::now();
         let entities = arena
             .entities()
             .values()
@@ -544,6 +656,10 @@ impl ServerManager {
                 position: entity.position(),
                 health: entity.health(),
                 energy: entity.energy(),
+                direction: entity.direction(),
+                cooldowns: skills::all()
+                    .map(|(id, _)| entity.cooldown(id, now).as_millis().min(u16::MAX as u128) as u16)
+                    .collect(),
             })
             .collect();
 
@@ -554,9 +670,10 @@ impl ServerManager {
                 id: spell.id(),
                 spec_id: spell.spec_id(),
                 position: spell.position(),
+                owner: spell.entity_origin_id(),
             })
             .collect();
 
-        ServerMessage::GameStep(Frame { entities, spells })
+        ServerMessage::GameStep(Frame { entities, spells, storm: arena.storm() })
     }
 }

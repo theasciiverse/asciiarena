@@ -1,76 +1,90 @@
 mod application;
-mod configuration;
+pub mod configuration;
 mod state;
 mod store;
 mod server_proxy;
 mod terminal;
 
 use application::{Application};
-use configuration::{Config};
+use configuration::{Config, Start, MatchOptions};
 
 use crate::logger::{self};
+use crate::server::{self, MatchSettings};
+use crate::settings::{Settings};
 
-use clap::{App, Arg, ArgMatches};
+use clap::{Arg, ArgMatches, Command};
 
 use std::net::{SocketAddr};
 
-lazy_static! {
-    static ref DEFAULT_LOG_FILE: String =
-        format!("asciiarena_client_{}.log", chrono::Local::now().format("%Y-%m-%d_%H:%M:%S"));
+fn character_arg() -> Arg {
+    Arg::new("character")
+        .long("character")
+        .short('c')
+        .value_name("CAPITAL_LETTER")
+        .value_parser(|name: &str| match super::util::is_valid_character_name(name) {
+            true => Ok(name.chars().next().unwrap()),
+            false => Err(String::from("The character must be an unique capital letter")),
+        })
+        .help("Set the player's character. Must be unique in the server")
 }
 
-pub fn configure_cli<'a, 'b>() -> App<'a, 'b> {
-    App::new("client")
-        .about("Running asciiarena client mode")
+pub fn configure_cli() -> Command {
+    Command::new("client")
+        .about("Joins a game on the local network")
+        .arg(character_arg())
         .arg(
-            Arg::with_name("log")
-                .long("log")
-                .short("l")
-                .value_name("LEVEL")
-                .default_value("off")
-                .possible_values(&logger::LOG_LEVELS)
-                .help("Set the log level of verbosity"),
-        )
-        .arg(
-            Arg::with_name("log-file")
-                .long("log-file")
-                .value_name("FILE")
-                .default_value(&DEFAULT_LOG_FILE)
-                .help("Set the log file"),
-        )
-        .arg(
-            Arg::with_name("character")
-                .long("character")
-                .short("c")
-                .value_name("CAPITAL_LETTER")
-                .validator(|name| match super::util::is_valid_character_name(&name) {
-                    true => Ok(()),
-                    false => Err("The character must be an unique capital letter".into()),
-                })
-                .help("Set the player's character. Must be unique in the server"),
-        )
-        .arg(
-            Arg::with_name("host")
+            Arg::new("host")
                 .long("host")
-                .short("h")
                 .value_name("HOST")
-                .validator(|host| match host.parse::<SocketAddr>() {
-                    Ok(_) => Ok(()),
-                    Err(_) => Err("Host must be a valid network address".into()),
+                .value_parser(|host: &str| {
+                    host.parse::<SocketAddr>()
+                        .map_err(|_| String::from("Host must be a valid network address"))
                 })
                 .help("Set the server address (ip and port). Format example: 192.168.0.56:3549"),
         )
 }
 
-pub fn run(matches: &ArgMatches) {
-    let level = matches.value_of("log").unwrap().parse().unwrap();
-    let file_name = matches.value_of("log-file").unwrap();
-    logger::init(level, logger::Output::File(file_name));
+pub fn solo_cli() -> Command {
+    Command::new("solo")
+        .about("Goes straight into a match against computer players")
+        .arg(character_arg())
+        .args(server::match_args())
+}
+
+pub fn run(matches: &ArgMatches, start: Start) {
+    logger::init(matches, logger::Mode::Client);
+
+    let settings = Settings::load();
+    let mut options = MatchOptions::load(&settings);
+    let character = matches.try_get_one::<char>("character").ok().flatten().copied();
+    if let Some(letter) = character {
+        options.letter = letter;
+    }
+
+    if start == Start::Solo {
+        let defaults = MatchSettings {
+            bots: options.bots,
+            level: options.level,
+            rounds: options.rounds,
+            arena: options.arena,
+            ..MatchSettings::default()
+        };
+        let chosen = MatchSettings::from_matches(matches, defaults);
+        options.bots = chosen.bots.max(1);
+        options.level = chosen.level;
+        options.rounds = chosen.rounds;
+        options.arena = chosen.arena;
+        options.points = chosen.points;
+        options.storm_after = chosen.storm_after;
+    }
 
     let config = Config {
-        character: matches.value_of("character").map(|name| name.chars().next().unwrap()),
-        server_addr: matches.value_of("host").map(|addr| addr.parse().unwrap()),
+        character,
+        server_addr: matches.try_get_one::<SocketAddr>("host").ok().flatten().copied(),
+        start,
+        options,
     };
 
-    Application::new(config).run();
+    log::info!("asciiarena {} starts: {:?}", env!("CARGO_PKG_VERSION"), start);
+    Application::new(config, settings).run();
 }

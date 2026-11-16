@@ -3,11 +3,11 @@ use crate::vec2::Vec2;
 use serde::{Serialize, Deserialize};
 
 use rand::{
-    distributions::{Distribution, Standard},
+    distr::{Distribution, StandardUniform},
     Rng,
 };
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Direction {
     Up,
     Down,
@@ -16,6 +16,27 @@ pub enum Direction {
 }
 
 impl Direction {
+    pub const ALL: [Direction; 4] = [Direction::Up, Direction::Right, Direction::Down, Direction::Left];
+
+    /// The direction of a straight line from the origin to `vec`, if there is one.
+    pub fn from_vec2(vec: Vec2) -> Option<Direction> {
+        match (vec.x.signum(), vec.y.signum()) {
+            (0, -1) => Some(Direction::Up),
+            (1, 0) => Some(Direction::Right),
+            (0, 1) => Some(Direction::Down),
+            (-1, 0) => Some(Direction::Left),
+            _ => None,
+        }
+    }
+
+    /// The two directions at a right angle to this one.
+    pub fn perpendiculars(&self) -> [Direction; 2] {
+        match *self {
+            Direction::Up | Direction::Down => [Direction::Left, Direction::Right],
+            Direction::Left | Direction::Right => [Direction::Up, Direction::Down],
+        }
+    }
+
     pub fn to_vec2(&self) -> Vec2 {
         match *self {
             Direction::Up => Vec2::y(-1),
@@ -53,9 +74,9 @@ impl Direction {
     }
 }
 
-impl Distribution<Direction> for Standard {
+impl Distribution<Direction> for StandardUniform {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Direction {
-        match rng.gen_range(0..4) {
+        match rng.random_range(0..4) {
             0 => Direction::Up,
             1 => Direction::Right,
             2 => Direction::Down,

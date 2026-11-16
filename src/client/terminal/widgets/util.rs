@@ -1,12 +1,12 @@
-use tui::layout::{Rect};
+use ratatui::layout::{Rect};
 
 use crossterm::event::{KeyEvent, KeyCode};
 
 pub fn centered_area(base: Rect, dimension: (u16, u16)) -> Rect {
     let width_diff = base.width as i16 - dimension.0 as i16;
     let height_diff = base.height as i16 - dimension.1 as i16;
-    let x = if width_diff > 0 { base.x + width_diff as u16 / 2 } else { 0 };
-    let y = if height_diff > 0 { base.y + height_diff as u16 / 2 } else { 0 };
+    let x = if width_diff > 0 { base.x + width_diff as u16 / 2 } else { base.x };
+    let y = if height_diff > 0 { base.y + height_diff as u16 / 2 } else { base.y };
     let width = if base.width > dimension.0 { dimension.0 } else { base.width };
     let height = if base.height > dimension.1 { dimension.1 } else { base.height };
     Rect::new(x, y, width, height)
@@ -14,7 +14,7 @@ pub fn centered_area(base: Rect, dimension: (u16, u16)) -> Rect {
 
 pub fn vertically_centered(base: Rect, height: u16) -> Rect {
     let height_diff = base.height as i16 - height as i16;
-    let y = if height_diff > 0 { base.y + height_diff as u16 / 2 } else { 0 };
+    let y = if height_diff > 0 { base.y + height_diff as u16 / 2 } else { base.y };
     let height = if base.height > height { height } else { base.height };
     Rect::new(base.x, y, base.width, height)
 }
@@ -87,6 +87,13 @@ impl InputText {
         self.content.as_str()
     }
 
+    pub fn set_content(&mut self, content: String) {
+        self.content = content;
+        if let Some(cursor) = self.cursor.as_mut() {
+            *cursor = (*cursor).min(self.content.len());
+        }
+    }
+
     pub fn cursor_position(&self) -> Option<usize> {
         self.cursor
     }
@@ -127,6 +134,10 @@ impl InputCapitalLetter {
 
     pub fn has_focus(&self) -> bool {
         self.focus
+    }
+
+    pub fn set_content(&mut self, content: char) {
+        self.content = Some(content);
     }
 
     pub fn content(&self) -> Option<char> {

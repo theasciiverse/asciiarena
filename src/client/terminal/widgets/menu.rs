@@ -2,7 +2,7 @@ use super::util::{self, InputText, InputCapitalLetter};
 use super::waiting_room::{WaitingRoom, WaitingRoomWidget};
 
 use crate::client::configuration::{Config};
-use crate::client::state::{State, VersionInfo, GameStatus};
+use crate::client::state::{State, VersionInfo, GameStatus, Session};
 use crate::client::server_proxy::{ConnectionStatus};
 use crate::client::store::{Store, Action};
 use crate::client::terminal::input::{InputEvent};
@@ -11,11 +11,11 @@ use crate::client::terminal::renderer::{Cursor};
 use crate::version::{self, Compatibility};
 use crate::message::{LoginStatus};
 
-use tui::buffer::{Buffer};
-use tui::widgets::{Block, Borders, BorderType, Paragraph, Widget, StatefulWidget};
-use tui::layout::{Layout, Constraint, Direction, Rect, Alignment, Margin};
-use tui::style::{Style, Modifier, Color};
-use tui::text::{Span, Spans};
+use ratatui::buffer::{Buffer};
+use ratatui::widgets::{Block, Borders, BorderType, Paragraph, Widget, StatefulWidget};
+use ratatui::layout::{Layout, Constraint, Direction, Rect, Alignment, Margin};
+use ratatui::style::{Style, Modifier, Color};
+use ratatui::text::{Span, Line};
 
 use crossterm::event::{KeyCode};
 
@@ -31,8 +31,13 @@ pub struct Menu {
 impl Menu {
     pub fn new(config: &Config) -> Menu {
         Menu {
-            server_addr_input: InputText::new(config.server_addr.map(|addr| addr.to_string())),
-            character_symbol_input: InputCapitalLetter::new(config.character),
+            server_addr_input: InputText::new(
+                config
+                    .server_addr
+                    .map(|addr| addr.to_string())
+                    .or_else(|| crate::settings::Settings::load().get("server").map(String::from)),
+            ),
+            character_symbol_input: InputCapitalLetter::new(config.character.or(Some(config.options.letter))),
             waiting_room: WaitingRoom::new(
                 WaitingRoomPanelWidget::WIDTH - 2,
                 ServerInfoPanelWidget::HEIGHT - 2,
@@ -58,6 +63,10 @@ impl Menu {
                         }
                     }
                     KeyCode::Esc => {
+                        if let Some(Session::Host { .. }) = store.state().session {
+                            // The game is served from here: leaving ends it.
+                            return store.dispatch(Action::LeaveGame)
+                        }
                         if let Some(LoginStatus::Logged(..)) = store.state().user.login_status {
                             if !store.state().server.is_full() {
                                 store.dispatch(Action::Logout);
@@ -67,7 +76,7 @@ impl Menu {
                             store.dispatch(Action::Disconnect);
                         }
                         else {
-                            return store.dispatch(Action::CloseApp)
+                            return store.dispatch(Action::LeaveGame)
                         }
                     }
                     _ => (),
@@ -75,7 +84,7 @@ impl Menu {
                 self.server_addr_input.key_pressed(key_event);
                 self.character_symbol_input.key_pressed(key_event);
             }
-            InputEvent::ResizeDisplay(_, _) => {}
+            InputEvent::ResizeDisplay => {}
         }
     }
 
@@ -91,6 +100,18 @@ impl Menu {
         else {
             (false, false)
         };
+
+        // A game this computer serves fills the fields in by itself.
+        if !server_addr_focus {
+            if let Some(addr) = state.server.addr {
+                if self.server_addr_input.content().is_empty() {
+                    self.server_addr_input.set_content(addr.to_string());
+                }
+            }
+        }
+        if let (Some(letter), true) = (state.user.character_symbol, state.user.is_logged()) {
+            self.character_symbol_input.set_content(letter);
+        }
 
         self.character_symbol_input.focus(character_focus);
         self.server_addr_input.focus(server_addr_focus);
@@ -142,6 +163,8 @@ impl StatefulWidget for MenuWidget<'_> {
 
         VersionPanelWidget.render(column[1], buffer);
 
+        HostLabelWidget::new(self.state).render(column[2], buffer);
+
         ClientInfoPanelWidget::new(self.state, self.menu).render(column[3], buffer, cursor);
 
         let row = Layout::default()
@@ -165,7 +188,7 @@ impl StatefulWidget for MenuWidget<'_> {
     }
 }
 
-struct TitlePanelWidget;
+pub struct TitlePanelWidget;
 
 impl TitlePanelWidget {
     const MAIN_TITLE: &'static str = concat!(
@@ -183,7 +206,7 @@ impl TitlePanelWidget {
         "\n",
     );
 
-    fn dimension() -> (u16, u16) {
+    pub fn dimension() -> (u16, u16) {
         (
             Self::MAIN_TITLE.find('\n').unwrap() as u16,
             Self::MAIN_TITLE.chars().filter(|&c| c == '\n').count() as u16,
@@ -193,10 +216,17 @@ impl TitlePanelWidget {
 
 impl Widget for TitlePanelWidget {
     fn render(self, area: Rect, buffer: &mut Buffer) {
-        Paragraph::new(Self::MAIN_TITLE)
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .alignment(Alignment::Left)
-            .render(area, buffer);
+        // The letters warm from gold at the top to ember red at the base.
+        const SHADES: [u8; 6] = [222, 221, 215, 209, 203, 167];
+        let lines = Self::MAIN_TITLE
+            .lines()
+            .enumerate()
+            .map(|(row, text)| {
+                let color = Color::Indexed(SHADES[row.min(SHADES.len() - 1)]);
+                Line::from(Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+            })
+            .collect::<Vec<_>>();
+        Paragraph::new(lines).alignment(Alignment::Left).render(area, buffer);
     }
 }
 
@@ -217,6 +247,35 @@ impl Widget for VersionPanelWidget {
             let version = Span::styled(message, Style::default().fg(Color::Gray));
 
             Paragraph::new(version).alignment(Alignment::Left).render(area, buffer);
+        }
+    }
+}
+
+/// Where the others on the local network find a game this computer hosts.
+#[derive(derive_new::new)]
+struct HostLabelWidget<'a> {
+    state: &'a State,
+}
+
+impl Widget for HostLabelWidget<'_> {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        if let Some(Session::Host { lan_ip, port }) = &self.state.session {
+            let bold = Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD);
+            let gray = Style::default().fg(Color::Gray);
+            let line = match lan_ip {
+                Some(ip) => Line::from(vec![
+                    Span::styled("Hosting at ", gray),
+                    Span::styled(format!("{}:{}", ip, port), bold),
+                    Span::styled(" · the others choose Join a LAN game", gray),
+                ]),
+                None => Line::from(vec![
+                    Span::styled("Hosting on port ", gray),
+                    Span::styled(port.to_string(), bold),
+                    Span::styled(" of this computer", gray),
+                ]),
+            };
+            let area = Rect::new(area.x, area.y, area.width, 1).intersection(area);
+            Paragraph::new(line).alignment(Alignment::Center).render(area, buffer);
         }
     }
 }
@@ -256,7 +315,7 @@ struct ServerAddressLabelWidget<'a> {
 impl StatefulWidget for ServerAddressLabelWidget<'_> {
     type State = Cursor;
     fn render(self, area: Rect, buffer: &mut Buffer, cursor: &mut Cursor) {
-        let server_addrees_msg = Spans::from(vec![
+        let server_addrees_msg = Line::from(vec![
             Span::raw("Server address:  "),
             Span::styled(
                 self.menu.server_addr_input.content(),
@@ -308,7 +367,7 @@ impl StatefulWidget for CharacterLabelWidget<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer, cursor: &mut Cursor) {
         let character = self.menu.character_symbol_input.content().unwrap_or(' ');
 
-        let character_msg = Spans::from(vec![
+        let character_msg = Line::from(vec![
             Span::raw("Character name:  "),
             Span::styled(character.to_string(), Style::default().add_modifier(Modifier::BOLD)),
         ]);
@@ -357,7 +416,7 @@ impl Widget for ServerInfoPanelWidget<'_> {
             .title(Span::styled("Server info", Style::default().add_modifier(Modifier::BOLD)))
             .render(area, buffer);
 
-        let inner = area.inner(&Margin { vertical: 1, horizontal: 2 });
+        let inner = area.inner(Margin { vertical: 1, horizontal: 2 });
 
         if self.state.server.game_info.is_some() {
             ServerInfoWithContentPanelWidget::new(self.state).render(inner, buffer);
@@ -378,7 +437,7 @@ impl Widget for ServerInfoWithoutContentPanelWidget<'_> {
         let message =
             if let Some(VersionInfo { version, compatibility }) = &self.state.server.version_info {
                 if !compatibility.is_compatible() {
-                    Spans::from(vec![
+                    Line::from(vec![
                         Span::styled(
                             "Incompatible versions. Server:",
                             Style::default().fg(Color::LightRed),
@@ -390,14 +449,14 @@ impl Widget for ServerInfoWithoutContentPanelWidget<'_> {
                     ])
                 }
                 else {
-                    Spans::from(Span::styled(
+                    Line::from(Span::styled(
                         "Loading information...",
                         Style::default().fg(Color::Gray),
                     ))
                 }
             }
             else {
-                Spans::from(Span::styled("Without information", Style::default().fg(Color::Gray)))
+                Line::from(Span::styled("Without information", Style::default().fg(Color::Gray)))
             };
 
         Paragraph::new(message)
@@ -444,7 +503,7 @@ impl Widget for ServerInfoVersionLabelWidget<'_> {
         let VersionInfo { version, compatibility } =
             self.state.server.version_info.as_ref().unwrap();
 
-        let left = Spans::from(vec![
+        let left = Line::from(vec![
             Span::raw("Version:  "),
             Span::styled(version, Style::default().add_modifier(Modifier::BOLD)),
         ]);
@@ -471,7 +530,7 @@ struct ServerInfoUdpLabelWidget<'a> {
 impl Widget for ServerInfoUdpLabelWidget<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let udp_port = self.state.server.udp_port.unwrap();
-        let left = Spans::from(vec![
+        let left = Line::from(vec![
             Span::raw("UDP port: "),
             Span::styled(udp_port.to_string(), Style::default().add_modifier(Modifier::BOLD)),
         ]);
@@ -502,11 +561,9 @@ struct ServerInfoMapSizeLabelWidget<'a> {
 impl Widget for ServerInfoMapSizeLabelWidget<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let game_info = self.state.server.game_info.as_ref().unwrap();
-        let map_size = game_info.map_size;
-        let dimension = format!("{}x{}", map_size, map_size);
-        let left = Spans::from(vec![
-            Span::raw("Map size: "),
-            Span::styled(dimension, Style::default().add_modifier(Modifier::BOLD)),
+        let left = Line::from(vec![
+            Span::raw("Arena:    "),
+            Span::styled(game_info.arena.clone(), Style::default().add_modifier(Modifier::BOLD)),
         ]);
 
         Paragraph::new(left).alignment(Alignment::Left).render(area, buffer);
@@ -521,11 +578,17 @@ struct ServerInfoPointsLabelWidget<'a> {
 impl Widget for ServerInfoPointsLabelWidget<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let game_info = self.state.server.game_info.as_ref().unwrap();
-        let points = game_info.winner_points.to_string();
-        let left = Spans::from(vec![
-            Span::raw("Points:   "),
-            Span::styled(points, Style::default().add_modifier(Modifier::BOLD)),
-        ]);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let mut left = vec![Span::raw("Rounds:   "), Span::styled(game_info.rounds.to_string(), bold)];
+        if game_info.winner_points > 0 {
+            left.push(Span::raw(" · first to "));
+            left.push(Span::styled(game_info.winner_points.to_string(), bold));
+        }
+        if game_info.bots > 0 {
+            left.push(Span::raw(" · bots: "));
+            left.push(Span::styled(format!("{} {}", game_info.bots, game_info.bot_level.name()), bold));
+        }
+        let left = Line::from(left);
 
         Paragraph::new(left).alignment(Alignment::Left).render(area, buffer);
     }
@@ -542,7 +605,7 @@ impl Widget for ServerInfoPlayersLabelWidget<'_> {
         let current_players_number = self.state.server.logged_players.len();
 
         let players_ratio = format!("{}/{}", current_players_number, game_info.players_number);
-        let left = Spans::from(vec![
+        let left = Line::from(vec![
             Span::raw("Players:  "),
             Span::styled(players_ratio, Style::default().add_modifier(Modifier::BOLD)),
         ]);
@@ -592,7 +655,7 @@ impl Widget for WaitingRoomPanelWidget<'_> {
             .title(Span::styled(message, Style::default().add_modifier(Modifier::BOLD)))
             .render(area, buffer);
 
-        let inner = area.inner(&Margin { vertical: 1, horizontal: 1 });
+        let inner = area.inner(Margin { vertical: 1, horizontal: 1 });
 
         WaitingRoomWidget::new(&self.menu.waiting_room).render(inner, buffer);
     }
@@ -624,23 +687,23 @@ impl Widget for NotificationLabelWidget<'_> {
             || !self.state.server.has_compatible_version()
         {
             vec![
-                Spans::from(vec![Span::raw("Press"), enter, Span::raw("to connect to server")]),
-                Spans::from(vec![Span::raw("Press"), esc, Span::raw("to exit from asciiarena")]),
+                Line::from(vec![Span::raw("Press"), enter, Span::raw("to connect to server")]),
+                Line::from(vec![Span::raw("Press"), esc, Span::raw("to go back to the menu")]),
             ]
         }
         else if !self.state.user.is_logged() {
             vec![
                 if self.menu.character_symbol_input.content().is_none() {
-                    Spans::from(vec![Span::raw("Choose a character (an ascii uppercase letter)")])
+                    Line::from(vec![Span::raw("Choose a character (an ascii uppercase letter)")])
                 }
                 else {
-                    Spans::from(vec![
+                    Line::from(vec![
                         Span::raw("Press"),
                         enter,
                         Span::raw("to login with the character"),
                     ])
                 },
-                Spans::from(vec![
+                Line::from(vec![
                     Span::raw("Press"),
                     esc,
                     Span::raw("to disconnect from the server"),
@@ -657,14 +720,17 @@ impl Widget for NotificationLabelWidget<'_> {
 
             let style = Style::default().fg(Color::LightCyan);
 
-            vec![Spans::from(vec![
+            vec![Line::from(vec![
                 Span::styled("Starting game in ", style),
                 Span::styled(waiting_secs.to_string(), style.add_modifier(Modifier::BOLD)),
                 Span::styled("...", style),
             ])]
         }
+        else if let Some(Session::Host { .. }) = self.state.session {
+            vec![Line::from(vec![Span::raw("Press"), esc, Span::raw("to stop hosting")])]
+        }
         else {
-            vec![Spans::from(vec![Span::raw("Press"), esc, Span::raw("to logout the character")])]
+            vec![Line::from(vec![Span::raw("Press"), esc, Span::raw("to logout the character")])]
         };
 
         Paragraph::new(messages).alignment(Alignment::Center).render(area, buffer);

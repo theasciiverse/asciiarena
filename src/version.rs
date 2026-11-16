@@ -1,4 +1,4 @@
-use clap::{crate_version};
+// The protocol version is the package version.
 use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -62,5 +62,5 @@ pub fn check(client_tag: &str, server_tag: &str) -> Compatibility {
 }
 
 pub const fn current() -> &'static str {
-    crate_version!()
+    env!("CARGO_PKG_VERSION")
 }

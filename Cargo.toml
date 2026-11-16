@@ -1,33 +1,31 @@
 [package]
 name = "asciiarena"
 description = "Terminal multiplayer deathmatch game"
-version = "0.0.7"
+version = "0.1.0"
 authors = ["lemunozm <lemunozm@gmail.com>"]
-edition = "2018"
+edition = "2021"
+rust-version = "1.88"
 readme = "README.md"
 license = "Apache-2.0"
 homepage = "https://github.com/lemunozm/asciiarena"
 repository = "https://github.com/lemunozm/asciiarena"
-keywords = ["game", "terminal", "multiplayer", "deatchmatch", "ascii"]
-categories = ["command-line-utilities", "command-line-interface", "games", "gui", "network-programming"]
-
-[badges]
-maintenance = { status = "actively-developed" }
+keywords = ["game", "terminal", "multiplayer", "deathmatch", "ascii"]
+categories = ["command-line-utilities", "command-line-interface", "games", "network-programming"]
 
 [dependencies]
-message-io = "0.13.3"
-bincode = "1.3.2"
+message-io = { version = "0.19", default-features = false, features = ["tcp", "udp"] }
+bincode = { version = "2", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-fern = { version = "0.6", features = ["colored"] }
-chrono = "0.4"
-colored = "2.0.0"
-clap = { version = "2.33.1", features = ["wrap_help"] }
-ctrlc = "3.1.5"
-rand = "0.8.4"
-lazy_static = "1.4.0"
-itertools = "0.10.1"
-crossterm = "0.20"
-tui = { version = "0.15", default-features = false, features = ['crossterm'] }
-derive-new = "0.5.8"
-derive_builder = "0.10.2"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+clap = { version = "4.5", features = ["wrap_help", "cargo"] }
+ctrlc = "3.4"
+rand = "0.9"
+itertools = "0.14"
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+derive-new = "0.7"
+derive_builder = "0.20"
+
+[profile.release]
+debug = 1

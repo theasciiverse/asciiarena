@@ -2,7 +2,7 @@ use std::ops::{Add, Sub, Mul, Div, Neg, AddAssign, SubAssign, MulAssign, DivAssi
 
 use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Vec2 {
     pub x: i32,
     pub y: i32,
@@ -37,6 +37,33 @@ impl Vec2 {
     pub fn square_length(&self) -> i32 {
         self.x * self.x + self.y * self.y
     }
+
+    /// Steps needed when moving in eight directions.
+    pub fn chebyshev_length(&self) -> i32 {
+        self.x.abs().max(self.y.abs())
+    }
+
+    /// Steps needed when moving in four directions.
+    pub fn manhattan_length(&self) -> i32 {
+        self.x.abs() + self.y.abs()
+    }
+
+    /// Same vector with each component reduced to -1, 0 or 1.
+    pub fn signum(&self) -> Vec2 {
+        Vec2 { x: self.x.signum(), y: self.y.signum() }
+    }
+
+    /// The eight unit steps around a cell, clockwise from up.
+    pub const AROUND: [Vec2; 8] = [
+        Vec2 { x: 0, y: -1 },
+        Vec2 { x: 1, y: -1 },
+        Vec2 { x: 1, y: 0 },
+        Vec2 { x: 1, y: 1 },
+        Vec2 { x: 0, y: 1 },
+        Vec2 { x: -1, y: 1 },
+        Vec2 { x: -1, y: 0 },
+        Vec2 { x: -1, y: -1 },
+    ];
 }
 
 impl Add for Vec2 {

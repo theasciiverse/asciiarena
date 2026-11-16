@@ -96,8 +96,8 @@ impl<U: Eq> RoomSession<U> {
 
     fn generate_unique_token(&self) -> SessionToken {
         loop {
-            let mut rng = rand::thread_rng();
-            let token: SessionToken = rng.gen();
+            let mut rng = rand::rng();
+            let token: SessionToken = rng.random::<u64>() as SessionToken;
             if !self.sessions.contains_key(&token) {
                 break token
             }

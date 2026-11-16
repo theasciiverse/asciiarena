@@ -24,9 +24,16 @@ impl TerminalEventCollector {
             thread::Builder::new().name("asciiarena: terminal event collector".into()).spawn(
                 move || {
                     while running.load(Ordering::Relaxed) {
-                        if crossterm::event::poll(timeout).unwrap() {
-                            let event = crossterm::event::read().unwrap();
-                            event_callback(event);
+                        match crossterm::event::poll(timeout) {
+                            Ok(true) => match crossterm::event::read() {
+                                Ok(event) => event_callback(event),
+                                Err(error) => log::error!("Terminal read: {}", error),
+                            },
+                            Ok(false) => (),
+                            Err(error) => {
+                                log::error!("Terminal poll: {}", error);
+                                thread::sleep(timeout);
+                            }
                         }
                     }
                 },

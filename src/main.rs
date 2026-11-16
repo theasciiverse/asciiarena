@@ -1,5 +1,3 @@
-#[macro_use]
-extern crate lazy_static;
 extern crate derive_new;
 #[macro_use]
 extern crate derive_builder;
@@ -8,6 +6,7 @@ mod client;
 mod server;
 
 mod logger;
+mod settings;
 mod version;
 mod message;
 mod encoding;
@@ -18,28 +17,49 @@ mod character;
 mod ids;
 mod specification;
 
-use clap::{self, App, AppSettings};
+use client::configuration::{Start};
 
-fn main() {
-    let mut args: Vec<String> = std::env::args().collect();
-    // If the user do not specify a subcommand, then run automatically the client mode with no args.
-    // This facilitates the usage for distributables.
-    if args.len() == 1 {
-        args.push("client".into());
-    }
+use clap::{Arg, ArgAction, Command};
 
-    let matches = App::new(clap::crate_name!())
-        .version(clap::crate_version!())
-        .author(clap::crate_authors!())
-        .about(clap::crate_description!())
-        .setting(AppSettings::ArgRequiredElseHelp)
+fn cli() -> Command {
+    Command::new(env!("CARGO_PKG_NAME"))
+        .version(env!("CARGO_PKG_VERSION"))
+        .author(env!("CARGO_PKG_AUTHORS"))
+        .about(
+            "Terminal deathmatch: pick a letter and be the last one standing in the arena.\n\
+             With no command it opens the menu: play against computer players, \
+             or host or join a game on the local network.",
+        )
+        .args(logger::global_args())
+        .arg(
+            Arg::new("demo")
+                .long("demo")
+                .action(ArgAction::SetTrue)
+                .help("Watch the computer play every letter, match after match"),
+        )
+        .subcommand(client::solo_cli())
         .subcommand(client::configure_cli())
         .subcommand(server::configure_cli())
-        .get_matches_from(args);
+}
+
+fn main() {
+    let matches = cli().get_matches();
 
     match matches.subcommand() {
-        ("client", Some(matches)) => client::run(matches),
-        ("server", Some(matches)) => server::run(matches),
-        _ => unreachable!(),
+        Some(("client", matches)) => client::run(matches, Start::Join),
+        Some(("server", matches)) => server::run(matches),
+        Some(("solo", matches)) => client::run(matches, Start::Solo),
+        _ => match matches.get_flag("demo") {
+            true => client::run(&matches, Start::Demo),
+            false => client::run(&matches, Start::Home),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn command_line_is_well_formed() {
+        super::cli().debug_assert();
     }
 }

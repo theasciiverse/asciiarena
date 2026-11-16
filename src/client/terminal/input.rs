@@ -1,11 +1,11 @@
 use super::events::{TerminalEventCollector};
 
-use crossterm::event::{Event as TermEvent, KeyEvent};
+use crossterm::event::{Event as TermEvent, KeyEvent, KeyEventKind};
 
 #[derive(Debug)]
 pub enum InputEvent {
     KeyPressed(KeyEvent),
-    ResizeDisplay(usize, usize),
+    ResizeDisplay,
 }
 
 pub struct InputReceiver {
@@ -24,10 +24,15 @@ impl InputReceiver {
     fn process_event(event: TermEvent, event_callback: &impl Fn(InputEvent)) {
         match event {
             TermEvent::Key(key_event) => {
-                event_callback(InputEvent::KeyPressed(key_event));
+                log::debug!("key {:?} {:?} {:?}", key_event.code, key_event.modifiers, key_event.kind);
+                // Windows reports releases as well; a press and its repeats are what count.
+                if key_event.kind != KeyEventKind::Release {
+                    event_callback(InputEvent::KeyPressed(key_event));
+                }
             }
             TermEvent::Resize(width, height) => {
-                event_callback(InputEvent::ResizeDisplay(width as usize, height as usize));
+                log::debug!("resize {}x{}", width, height);
+                event_callback(InputEvent::ResizeDisplay);
             }
             _ => (),
         };

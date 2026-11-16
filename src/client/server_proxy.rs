@@ -1,6 +1,6 @@
 use crate::message::{
     LoginStatus, ServerInfo, ClientMessage, ServerMessage, LoggedKind, GameInfo, ArenaInfo, Frame,
-    GameEvent,
+    GameEvent, Standing,
 };
 use crate::encoding::{self, Encoder};
 use crate::version::{self, Compatibility};
@@ -14,10 +14,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration};
 
 const UDP_HANDSHAKE_MAX_ATTEMPS: usize = 10;
-
-lazy_static! {
-    static ref EVENT_SAMPLING_TIMEOUT: Duration = Duration::from_millis(50);
-}
 
 /// Server API requests
 #[derive(Debug)]
@@ -42,7 +38,7 @@ pub enum ServerEvent {
     LoginStatus(LoginStatus),
     UdpReachable(bool),
     StartGame(GameInfo),
-    FinishGame,
+    FinishGame(Vec<Standing>),
     GameEvent(GameEvent),
     GameStep(Frame),
     WaitArena(Duration),
@@ -143,18 +139,27 @@ impl ServerConnection {
         self.node.network().send(endpoint, self.encoder.encode(message));
     }
 
-    fn connect(&mut self, addr: SocketAddr) -> ConnectionStatus {
+    /// Sends over tcp, if there is a connection.
+    fn send_tcp(&mut self, message: ClientMessage) {
+        match self.connection.tcp {
+            Some(tcp) => self.send_to_server(tcp, message),
+            None => log::warn!("Not connected, {:?} not sent", message),
+        }
+    }
+
+    /// Starts connecting. The result comes as a `Connected` network event.
+    fn connect(&mut self, addr: SocketAddr) -> Option<ConnectionStatus> {
         self.disconnect(); // Ensure there is no connection, reset if there is.
         match self.node.network().connect(Transport::FramedTcp, addr) {
             Ok((tcp_endpoint, _)) => {
-                log::info!("Connected to server by tcp on {}", addr);
+                log::info!("Connecting to server by tcp on {}", addr);
                 self.connection.tcp = Some(tcp_endpoint);
                 self.connection.ip = Some(addr.ip());
-                ConnectionStatus::Connected
+                None
             }
             Err(_) => {
                 log::error!("Could not connect to server by tcp on {}", addr);
-                ConnectionStatus::NotFound
+                Some(ConnectionStatus::NotFound)
             }
         }
     }
@@ -176,8 +181,7 @@ impl ServerConnection {
         self.connection.has_udp_hasdshake = false;
         self.connection.session_token = None;
         self.connection.udp = None;
-        let tcp = *self.connection.tcp.as_ref().unwrap();
-        self.send_to_server(tcp, ClientMessage::Logout);
+        self.send_tcp(ClientMessage::Logout);
     }
 
     pub fn process_event(&mut self, event: NodeEvent<ProxyEvent>, callback: impl Fn(ServerEvent)) {
@@ -186,42 +190,57 @@ impl ServerConnection {
             NodeEvent::Signal(signal) => match signal {
                 ProxyEvent::Api(api_call) => match api_call {
                     ApiCall::Connect(addr) => {
-                        let result = self.connect(addr);
-                        callback(ServerEvent::ConnectionResult(result));
+                        if let Some(result) = self.connect(addr) {
+                            callback(ServerEvent::ConnectionResult(result));
+                        }
                     }
                     ApiCall::Disconnect => {
                         let result = self.disconnect();
                         callback(ServerEvent::ConnectionResult(result));
                     }
                     ApiCall::CheckVersion(version) => {
-                        let tcp = *self.connection.tcp.as_ref().unwrap();
-                        self.send_to_server(tcp, ClientMessage::Version(version));
+                        self.send_tcp(ClientMessage::Version(version));
                     }
                     ApiCall::SubscribeInfo => {
-                        let tcp = *self.connection.tcp.as_ref().unwrap();
-                        self.send_to_server(tcp, ClientMessage::SubscribeServerInfo);
+                        self.send_tcp(ClientMessage::SubscribeServerInfo);
                     }
                     ApiCall::Login(character) => {
-                        let tcp = *self.connection.tcp.as_ref().unwrap();
-                        self.send_to_server(tcp, ClientMessage::Login(character));
+                        self.send_tcp(ClientMessage::Login(character));
                     }
                     ApiCall::Logout => self.logout(),
                     ApiCall::MovePlayer(direction) => {
-                        let tcp = *self.connection.tcp.as_ref().unwrap();
-                        self.send_to_server(tcp, ClientMessage::MovePlayer(direction));
+                        self.send_tcp(ClientMessage::MovePlayer(direction));
                     }
                     ApiCall::CastSkill(direction, id) => {
-                        let tcp = *self.connection.tcp.as_ref().unwrap();
-                        self.send_to_server(tcp, ClientMessage::CastSkill(direction, id));
+                        self.send_tcp(ClientMessage::CastSkill(direction, id));
                     }
                 },
                 ProxyEvent::HelloUdp(attempt) => self.process_hello_udp(attempt, callback),
             },
             NodeEvent::Network(net_event) => match net_event {
-                NetEvent::Connected(_, _) => unreachable!(),
-                NetEvent::Disconnected(_) => {
-                    let result = ConnectionStatus::Lost;
-                    callback(ServerEvent::ConnectionResult(result));
+                NetEvent::Connected(endpoint, established) => {
+                    if Some(endpoint) == self.connection.tcp {
+                        let result = match established {
+                            true => {
+                                log::info!("Connected to server by tcp on {}", endpoint.addr());
+                                ConnectionStatus::Connected
+                            }
+                            false => {
+                                log::error!("Could not connect to server by tcp on {}", endpoint.addr());
+                                self.connection.tcp = None;
+                                ConnectionStatus::NotFound
+                            }
+                        };
+                        callback(ServerEvent::ConnectionResult(result));
+                    }
+                }
+                NetEvent::Accepted(..) => (),
+                NetEvent::Disconnected(endpoint) => {
+                    if Some(endpoint) == self.connection.tcp {
+                        self.connection.tcp = None;
+                        let result = ConnectionStatus::Lost;
+                        callback(ServerEvent::ConnectionResult(result));
+                    }
                 }
                 NetEvent::Message(endpoint, data) => match encoding::decode(data) {
                     Some(message) => match message {
@@ -243,8 +262,8 @@ impl ServerConnection {
                         ServerMessage::StartGame(game_info) => {
                             callback(ServerEvent::StartGame(game_info));
                         }
-                        ServerMessage::FinishGame => {
-                            self.process_finish_game(callback);
+                        ServerMessage::FinishGame(standings) => {
+                            self.process_finish_game(standings, callback);
                         }
                         ServerMessage::WaitArena(duration) => {
                             callback(ServerEvent::WaitArena(duration));
@@ -331,10 +350,14 @@ impl ServerConnection {
                 self.connection.session_token = Some(token);
 
                 let addr = SocketAddr::new(ip, udp_port);
-                let (endpoint, _) = self.node.network().connect(Transport::Udp, addr).unwrap();
-                self.connection.udp = Some(endpoint);
-                log::info!("Connection by udp on port {}", udp_port);
-                self.node.signals().send(ProxyEvent::HelloUdp(0));
+                match self.node.network().connect(Transport::Udp, addr) {
+                    Ok((endpoint, _)) => {
+                        self.connection.udp = Some(endpoint);
+                        log::info!("Connection by udp on port {}", udp_port);
+                        self.node.signals().send(ProxyEvent::HelloUdp(0));
+                    }
+                    Err(error) => log::warn!("No udp to the server ({}), tcp only", error),
+                }
             }
             LoginStatus::InvalidPlayerName => {
                 log::warn!("Invalid character name {}", character);
@@ -375,15 +398,14 @@ impl ServerConnection {
     }
 
     fn process_udp_connected(&mut self, callback: impl Fn(ServerEvent)) {
-        let tcp = *self.connection.tcp.as_ref().unwrap();
-        self.send_to_server(tcp, ClientMessage::TrustUdp);
+        self.send_tcp(ClientMessage::TrustUdp);
         self.connection.has_udp_hasdshake = true;
         log::info!("Client udp successful reachable from server");
         callback(ServerEvent::UdpReachable(true));
     }
 
-    fn process_finish_game(&mut self, callback: impl Fn(ServerEvent)) {
+    fn process_finish_game(&mut self, standings: Vec<Standing>, callback: impl Fn(ServerEvent)) {
         self.connection.has_udp_hasdshake = false;
-        callback(ServerEvent::FinishGame);
+        callback(ServerEvent::FinishGame(standings));
     }
 }
