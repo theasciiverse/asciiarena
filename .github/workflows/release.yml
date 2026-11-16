@@ -1,157 +1,114 @@
-# Based on BurntSushi/ripgrep
-
-# The way this works is a little weird. But basically, the create-release job
-# runs purely to initialize the GitHub release itself. Once done, the upload
-# URL of the release is saved as an artifact.
+# Builds AsciiArena for the Asciiverse catalog: one archive per target, named
+# <id>-<target>.tar.gz (Linux, macOS) or .zip (Windows), plus a SHA256SUMS file,
+# attached to a GitHub release (hub/catalog/SCHEMA.md, release.source = "github").
 #
-# The build-release job runs only once create-release is finished. It gets
-# the release upload URL by downloading the corresponding artifact (which was
-# uploaded by create-release). It then builds the release executables for each
-# supported platform and attaches them as release assets to the previously
-# created release.
-#
-# The key here is that we create the release only once.
+# On the pattern of tspace's and Torched's. Tags look like v0.1.0. AsciiArena is
+# pure Rust with no system libraries, so Linux builds are static musl binaries
+# that run on any distribution. Rust is pinned to 1.93.1: 1.99 and 1.100 were
+# seen to hang compiling some crates (rust-lang/rust#164727). macOS builds run
+# on macos-15 (Apple silicon) and macos-15-intel. Every job has a time limit,
+# and the release publishes whatever built, so one stuck runner never holds
+# back the others. The archives carry README.md and LICENSE.
 
 name: release
+
 on:
   push:
-    # Enable when testing release infrastructure on a branch.
-   #branches:
-   #  - master
-  #pull_request:
-  #  branches:
-   #   - master
-   tags:
-    - 'v[0-9]+.[0-9]+.[0-9]+'
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build and release"
+        required: true
+
+env:
+  ID: asciiarena
+  BIN: asciiarena
+  TAG: ${{ inputs.tag || github.ref_name }}
+  RUST: "1.93.1"
+
+permissions:
+  contents: write
+
 jobs:
-  create-release:
-    name: create-release
-    runs-on: ubuntu-latest
-    # env:
-      # Set to force version number, e.g., when no tag exists.
-      # RG_VERSION: TEST-0.0.0
-    steps:
-      - name: Create artifacts directory
-        run: mkdir artifacts
-
-      - name: Get the release version from the tag
-        if: env.TERMCHAT_VERSION == ''
-        run: |
-          # Apparently, this is the right way to get a tag name. Really?
-          #
-          # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
-          echo "TERMCHAT_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-          echo "version is: ${{ env.TERMCHAT_VERSION }}"
-
-      - name: Create GitHub release
-        id: release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.TERMCHAT_VERSION }}
-          release_name: ${{ env.TERMCHAT_VERSION }}
-
-      - name: Save release upload URL to artifact
-        run: echo "${{ steps.release.outputs.upload_url }}" > artifacts/release-upload-url
-
-      - name: Save version number to artifact
-        run: echo "${{ env.TERMCHAT_VERSION }}" > artifacts/release-version
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v1
-        with:
-          name: artifacts
-          path: artifacts
-
-  build-release:
-    name: build-release
-    needs: ['create-release']
-    runs-on: ${{ matrix.os }}
-    env:
-      # For some builds, we use cross to test on 32-bit and big-endian
-      # systems.
-      CARGO: cargo
-      TARGET_DIR: ./target
+  build:
     strategy:
+      fail-fast: false
       matrix:
-        build: [linux, macos, win-msvc, win-gnu]
         include:
-        - build: linux
-          os: ubuntu-18.04
-          rust: stable
-          target: x86_64-unknown-linux-musl
-        - build: macos
-          os: macos-latest
-          rust: stable
-          target: x86_64-apple-darwin
-        - build: win-msvc
-          os: windows-2019
-          rust: stable
-          target: x86_64-pc-windows-msvc
-        - build: win-gnu
-          os: windows-2019
-          rust: stable-x86_64-gnu
-          target: x86_64-pc-windows-gnu
-
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, test: true }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, runner: macos-15 }
+          - { target: x86_64-apple-darwin, runner: macos-15-intel }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2022, exe: .exe }
+          - { target: aarch64-pc-windows-msvc, runner: windows-2022, exe: .exe }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: ${{ matrix.rust }}
-        profile: minimal
-        override: true
-        target: ${{ matrix.target }}
+      - name: Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST"
 
-    - name: Get release download URL
-      uses: actions/download-artifact@v1
-      with:
-        name: artifacts
-        path: artifacts
+      - name: musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-    - name: Set release upload URL and release version
-      shell: bash
-      run: |
-        release_upload_url="$(cat artifacts/release-upload-url)"
-        echo "RELEASE_UPLOAD_URL=$release_upload_url" >> $GITHUB_ENV
-        echo "release upload url: $RELEASE_UPLOAD_URL"
-        release_version="$(cat artifacts/release-version)"
-        echo "RELEASE_VERSION=$release_version" >> $GITHUB_ENV
-        echo "release version: $RELEASE_VERSION"
+      - name: Test
+        if: matrix.test
+        run: cargo test --release --locked
 
-    - name: Build release binary
-      run: |
-        cargo build --release
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          file target/${{ matrix.target }}/release/$BIN${{ matrix.exe }} || true
 
-    - name: Build archive
-      shell: bash
-      run: |
-        staging="asciiarena-${{ env.RELEASE_VERSION }}-${{ matrix.target }}"
-        mkdir -p "$staging"
+      - name: Package for av
+        shell: bash
+        run: |
+          # the binary sits at the top of the archive, where av looks for it
+          mkdir -p stage dist
+          cp target/${{ matrix.target }}/release/$BIN${{ matrix.exe }} README.md LICENSE stage/
+          if [ -n "${{ matrix.exe }}" ]; then
+            (cd stage && 7z a -tzip "../dist/$ID-${{ matrix.target }}.zip" .)
+          else
+            strip stage/$BIN || true
+            tar -czf "dist/$ID-${{ matrix.target }}.tar.gz" -C stage .
+          fi
 
-        cp {README.md,LICENSE} "$staging/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
 
-        if [ "${{ matrix.os }}" = "windows-2019" ]; then
-          cp "target/release/asciiarena.exe" "$staging/"
-          7z a "$staging.zip" "$staging"
-          echo "ASSET=$staging.zip" >> $GITHUB_ENV
-        else
-          cp "target/release/asciiarena" "$staging/"
-          tar czf "$staging.tar.gz" "$staging"
-          echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
-        fi
+  release:
+    needs: [build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
-    - name: Upload release archive
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ env.RELEASE_UPLOAD_URL }}
-        asset_path: ${{ env.ASSET }}
-        asset_name: ${{ env.ASSET }}
-        asset_content_type: application/octet-stream
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "AsciiArena $TAG" \
+                 --notes "AsciiArena $TAG for the Asciiverse catalog. Its README lists the controls."
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber

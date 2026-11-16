@@ -1,5 +1,15 @@
 # Changelog
 
+## Release 0.1.0 (Asciiverse edition)
+- Five skills on their own keys: Fire ball, Dash, Nova, Wall, Mine; energy and cooldowns.
+- Five arenas, the storm, matches of several rounds and a final table.
+- Computer players at three levels; play solo from the new main menu.
+- Host or join a game on the local network from the menu.
+- Kill feed, colours per letter, skill bar.
+- `asciiarena solo`, `asciiarena --demo`, match options for `server`.
+- Settings remembered between games; session logging with `RUST_LOG`.
+- Updated to ratatui, crossterm 0.29, clap 4, message-io 0.19.
+
 ## Release 0.0.7 Alpha
 - Internal network improvements
 
